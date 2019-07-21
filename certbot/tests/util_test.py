@@ -1,17 +1,17 @@
 """Tests for certbot.util."""
 import argparse
 import errno
-import os
-import shutil
-import stat
 import unittest
 
 import mock
 import six
 from six.moves import reload_module  # pylint: disable=import-error
 
-from certbot import errors
 import certbot.tests.util as test_util
+from certbot import errors
+from certbot.compat import misc
+from certbot.compat import os
+from certbot.compat import filesystem
 
 
 class RunScriptTest(unittest.TestCase):
@@ -92,18 +92,22 @@ class LockDirUntilExit(test_util.TempDirTestCase):
     @mock.patch('certbot.util.atexit_register')
     def test_it(self, mock_register, mock_logger):
         subdir = os.path.join(self.tempdir, 'subdir')
-        os.mkdir(subdir)
+        filesystem.mkdir(subdir)
         self._call(self.tempdir)
         self._call(subdir)
         self._call(subdir)
 
         self.assertEqual(mock_register.call_count, 1)
         registered_func = mock_register.call_args[0][0]
-        shutil.rmtree(subdir)
-        registered_func()  # exception not raised
-        # logger.debug is only called once because the second call
-        # to lock subdir was ignored because it was already locked
-        self.assertEqual(mock_logger.debug.call_count, 1)
+
+        from certbot import util
+        # Despite lock_dir_until_exit has been called twice to subdir, its lock should have been
+        # added only once. So we expect to have two lock references: for self.tempdir and subdir
+        self.assertTrue(len(util._LOCKS) == 2)  # pylint: disable=protected-access
+        registered_func()  # Exception should not be raised
+        # Logically, logger.debug, that would be invoked in case of unlock failure,
+        # should never been called.
+        self.assertEqual(mock_logger.debug.call_count, 0)
 
 
 class SetUpCoreDirTest(test_util.TempDirTestCase):
@@ -116,7 +120,7 @@ class SetUpCoreDirTest(test_util.TempDirTestCase):
     @mock.patch('certbot.util.lock_dir_until_exit')
     def test_success(self, mock_lock):
         new_dir = os.path.join(self.tempdir, 'new')
-        self._call(new_dir, 0o700, os.geteuid(), False)
+        self._call(new_dir, 0o700, misc.os_geteuid(), False)
         self.assertTrue(os.path.exists(new_dir))
         self.assertEqual(mock_lock.call_count, 1)
 
@@ -124,7 +128,7 @@ class SetUpCoreDirTest(test_util.TempDirTestCase):
     def test_failure(self, mock_make_or_verify):
         mock_make_or_verify.side_effect = OSError
         self.assertRaises(errors.Error, self._call,
-                          self.tempdir, 0o700, os.geteuid(), False)
+                          self.tempdir, 0o700, misc.os_geteuid(), False)
 
 
 class MakeOrVerifyDirTest(test_util.TempDirTestCase):
@@ -139,9 +143,9 @@ class MakeOrVerifyDirTest(test_util.TempDirTestCase):
         super(MakeOrVerifyDirTest, self).setUp()
 
         self.path = os.path.join(self.tempdir, "foo")
-        os.mkdir(self.path, 0o400)
+        filesystem.mkdir(self.path, 0o600)
 
-        self.uid = os.getuid()
+        self.uid = misc.os_geteuid()
 
     def _call(self, directory, mode):
         from certbot.util import make_or_verify_dir
@@ -151,17 +155,18 @@ class MakeOrVerifyDirTest(test_util.TempDirTestCase):
         path = os.path.join(self.tempdir, "bar")
         self._call(path, 0o650)
         self.assertTrue(os.path.isdir(path))
-        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o650)
+        self.assertTrue(misc.compare_file_modes(os.stat(path).st_mode, 0o650))
 
     def test_existing_correct_mode_does_not_fail(self):
-        self._call(self.path, 0o400)
-        self.assertEqual(stat.S_IMODE(os.stat(self.path).st_mode), 0o400)
+        self._call(self.path, 0o600)
+        self.assertTrue(misc.compare_file_modes(os.stat(self.path).st_mode, 0o600))
 
+    @test_util.skip_on_windows('Umask modes are mostly ignored on Windows.')
     def test_existing_wrong_mode_fails(self):
-        self.assertRaises(errors.Error, self._call, self.path, 0o600)
+        self.assertRaises(errors.Error, self._call, self.path, 0o400)
 
     def test_reraises_os_error(self):
-        with mock.patch.object(os, "makedirs") as makedirs:
+        with mock.patch.object(filesystem, "makedirs") as makedirs:
             makedirs.side_effect = OSError()
             self.assertRaises(OSError, self._call, "bar", 12312312)
 
@@ -177,19 +182,26 @@ class CheckPermissionsTest(test_util.TempDirTestCase):
     def setUp(self):
         super(CheckPermissionsTest, self).setUp()
 
-        self.uid = os.getuid()
+        self.uid = misc.os_geteuid()
 
     def _call(self, mode):
         from certbot.util import check_permissions
         return check_permissions(self.tempdir, mode, self.uid)
 
     def test_ok_mode(self):
-        os.chmod(self.tempdir, 0o600)
+        filesystem.chmod(self.tempdir, 0o600)
         self.assertTrue(self._call(0o600))
 
+    # TODO: reactivate the test when all logic from windows file permissions is merged.
+    @test_util.broken_on_windows
     def test_wrong_mode(self):
-        os.chmod(self.tempdir, 0o400)
-        self.assertFalse(self._call(0o600))
+        filesystem.chmod(self.tempdir, 0o400)
+        try:
+            self.assertFalse(self._call(0o600))
+        finally:
+            # Without proper write permissions, Windows is unable to delete a folder,
+            # even with admin permissions. Write access must be explicitly set first.
+            filesystem.chmod(self.tempdir, 0o700)
 
 
 class UniqueFileTest(test_util.TempDirTestCase):
@@ -208,16 +220,21 @@ class UniqueFileTest(test_util.TempDirTestCase):
         fd, name = self._call()
         fd.write("bar")
         fd.close()
-        self.assertEqual(open(name).read(), "bar")
+        with open(name) as f:
+            self.assertEqual(f.read(), "bar")
 
     def test_right_mode(self):
-        self.assertEqual(0o700, os.stat(self._call(0o700)[1]).st_mode & 0o777)
-        self.assertEqual(0o100, os.stat(self._call(0o100)[1]).st_mode & 0o777)
+        fd1, name1 = self._call(0o700)
+        fd2, name2 = self._call(0o600)
+        self.assertTrue(misc.compare_file_modes(0o700, os.stat(name1).st_mode))
+        self.assertTrue(misc.compare_file_modes(0o600, os.stat(name2).st_mode))
+        fd1.close()
+        fd2.close()
 
     def test_default_exists(self):
-        name1 = self._call()[1]  # create 0000_foo.txt
-        name2 = self._call()[1]
-        name3 = self._call()[1]
+        fd1, name1 = self._call()  # create 0000_foo.txt
+        fd2, name2 = self._call()
+        fd3, name3 = self._call()
 
         self.assertNotEqual(name1, name2)
         self.assertNotEqual(name1, name3)
@@ -233,6 +250,10 @@ class UniqueFileTest(test_util.TempDirTestCase):
         self.assertTrue(basename2.endswith("foo.txt"))
         basename3 = os.path.basename(name3)
         self.assertTrue(basename3.endswith("foo.txt"))
+
+        fd1.close()
+        fd2.close()
+        fd3.close()
 
 
 try:
@@ -253,28 +274,22 @@ class UniqueLineageNameTest(test_util.TempDirTestCase):
         f, path = self._call("wow")
         self.assertTrue(isinstance(f, file_type))
         self.assertEqual(os.path.join(self.tempdir, "wow.conf"), path)
+        f.close()
 
     def test_multiple(self):
+        items = []
         for _ in six.moves.range(10):
-            f, name = self._call("wow")
+            items.append(self._call("wow"))
+        f, name = items[-1]
         self.assertTrue(isinstance(f, file_type))
         self.assertTrue(isinstance(name, six.string_types))
         self.assertTrue("wow-0009.conf" in name)
+        for f, _ in items:
+            f.close()
 
-    @mock.patch("certbot.util.os.fdopen")
-    def test_failure(self, mock_fdopen):
-        err = OSError("whoops")
-        err.errno = errno.EIO
-        mock_fdopen.side_effect = err
-        self.assertRaises(OSError, self._call, "wow")
-
-    @mock.patch("certbot.util.os.fdopen")
-    def test_subsequent_failure(self, mock_fdopen):
-        self._call("wow")
-        err = OSError("whoops")
-        err.errno = errno.EIO
-        mock_fdopen.side_effect = err
-        self.assertRaises(OSError, self._call, "wow")
+    def test_failure(self):
+        with mock.patch("certbot.compat.filesystem.open", side_effect=OSError(errno.EIO)):
+            self.assertRaises(OSError, self._call, "wow")
 
 
 class SafelyRemoveTest(test_util.TempDirTestCase):
@@ -300,10 +315,10 @@ class SafelyRemoveTest(test_util.TempDirTestCase):
         # no error, yay!
         self.assertFalse(os.path.exists(self.path))
 
-    @mock.patch("certbot.util.os.remove")
-    def test_other_error_passthrough(self, mock_remove):
-        mock_remove.side_effect = OSError
-        self.assertRaises(OSError, self._call)
+    def test_other_error_passthrough(self):
+        with mock.patch("certbot.util.os.remove") as mock_remove:
+            mock_remove.side_effect = OSError
+            self.assertRaises(OSError, self._call)
 
 
 class SafeEmailTest(unittest.TestCase):
@@ -339,29 +354,28 @@ class AddDeprecatedArgumentTest(unittest.TestCase):
 
     def _call(self, argument_name, nargs):
         from certbot.util import add_deprecated_argument
-
         add_deprecated_argument(self.parser.add_argument, argument_name, nargs)
 
     def test_warning_no_arg(self):
         self._call("--old-option", 0)
-        stderr = self._get_argparse_warnings(["--old-option"])
-        self.assertTrue("--old-option is deprecated" in stderr)
+        with mock.patch("certbot.util.logger.warning") as mock_warn:
+            self.parser.parse_args(["--old-option"])
+        self.assertEqual(mock_warn.call_count, 1)
+        self.assertTrue("is deprecated" in mock_warn.call_args[0][0])
+        self.assertEqual("--old-option", mock_warn.call_args[0][1])
 
     def test_warning_with_arg(self):
         self._call("--old-option", 1)
-        stderr = self._get_argparse_warnings(["--old-option", "42"])
-        self.assertTrue("--old-option is deprecated" in stderr)
-
-    def _get_argparse_warnings(self, args):
-        stderr = six.StringIO()
-        with mock.patch("certbot.util.sys.stderr", new=stderr):
-            self.parser.parse_args(args)
-        return stderr.getvalue()
+        with mock.patch("certbot.util.logger.warning") as mock_warn:
+            self.parser.parse_args(["--old-option", "42"])
+        self.assertEqual(mock_warn.call_count, 1)
+        self.assertTrue("is deprecated" in mock_warn.call_args[0][0])
+        self.assertEqual("--old-option", mock_warn.call_args[0][1])
 
     def test_help(self):
         self._call("--old-option", 2)
         stdout = six.StringIO()
-        with mock.patch("certbot.util.sys.stdout", new=stdout):
+        with mock.patch("sys.stdout", new=stdout):
             try:
                 self.parser.parse_args(["-h"])
             except SystemExit:
@@ -512,24 +526,23 @@ class OsInfoTest(unittest.TestCase):
 
     def test_systemd_os_release(self):
         from certbot.util import (get_os_info, get_systemd_os_info,
-                                     get_os_info_ua)
+                                  get_os_info_ua)
 
-        with mock.patch('os.path.isfile', return_value=True):
+        with mock.patch('certbot.compat.os.path.isfile', return_value=True):
             self.assertEqual(get_os_info(
                 test_util.vector_path("os-release"))[0], 'systemdos')
             self.assertEqual(get_os_info(
                 test_util.vector_path("os-release"))[1], '42')
-            self.assertEqual(get_systemd_os_info("/dev/null"), ("", ""))
+            self.assertEqual(get_systemd_os_info(os.devnull), ("", ""))
             self.assertEqual(get_os_info_ua(
-                test_util.vector_path("os-release")),
-                "SystemdOS")
-        with mock.patch('os.path.isfile', return_value=False):
+                test_util.vector_path("os-release")), "SystemdOS")
+        with mock.patch('certbot.compat.os.path.isfile', return_value=False):
             self.assertEqual(get_systemd_os_info(), ("", ""))
 
     def test_systemd_os_release_like(self):
         from certbot.util import get_systemd_os_like
 
-        with mock.patch('os.path.isfile', return_value=True):
+        with mock.patch('certbot.compat.os.path.isfile', return_value=True):
             id_likes = get_systemd_os_like(test_util.vector_path(
                 "os-release"))
             self.assertEqual(len(id_likes), 3)
@@ -539,7 +552,7 @@ class OsInfoTest(unittest.TestCase):
     def test_non_systemd_os_info(self, popen_mock):
         from certbot.util import (get_os_info, get_python_os_info,
                                      get_os_info_ua)
-        with mock.patch('os.path.isfile', return_value=False):
+        with mock.patch('certbot.compat.os.path.isfile', return_value=False):
             with mock.patch('platform.system_alias',
                             return_value=('NonSystemD', '42', '42')):
                 self.assertEqual(get_os_info()[0], 'nonsystemd')
@@ -551,7 +564,7 @@ class OsInfoTest(unittest.TestCase):
                 comm_mock = mock.Mock()
                 comm_attrs = {'communicate.return_value':
                               ('42.42.42', 'error')}
-                comm_mock.configure_mock(**comm_attrs)  # pylint: disable=star-args
+                comm_mock.configure_mock(**comm_attrs)
                 popen_mock.return_value = comm_mock
                 self.assertEqual(get_os_info()[0], 'darwin')
                 self.assertEqual(get_os_info()[1], '42.42.42')
@@ -607,7 +620,7 @@ class AtexitRegisterTest(unittest.TestCase):
             self.assertTrue(mock_atexit.register.called)
             args, kwargs = mock_atexit.register.call_args
             atexit_func = args[0]
-            atexit_func(*args[1:], **kwargs)  # pylint: disable=star-args
+            atexit_func(*args[1:], **kwargs)
 
 
 if __name__ == "__main__":

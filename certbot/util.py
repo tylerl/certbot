@@ -2,29 +2,28 @@
 import argparse
 import atexit
 import collections
+from collections import OrderedDict
 # distutils.version under virtualenv confuses pylint
 # For more info, see: https://github.com/PyCQA/pylint/issues/73
 import distutils.version  # pylint: disable=import-error,no-name-in-module
 import errno
 import logging
-import os
 import platform
 import re
-import six
 import socket
-import stat
 import subprocess
-import sys
-
-from collections import OrderedDict
 
 import configargparse
+import six
 
 from acme.magic_typing import Tuple, Union  # pylint: disable=unused-import, no-name-in-module
+
 from certbot import constants
 from certbot import errors
 from certbot import lock
-
+from certbot.compat import misc
+from certbot.compat import os
+from certbot.compat import filesystem
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +61,7 @@ def run_script(params, log=logger.error):
     """Run the script with the given params.
 
     :param list params: List of parameters to pass to Popen
-    :param logging.Logger log: Logger to use for errors
+    :param callable log: Logger method to use for errors
 
     """
     try:
@@ -142,6 +141,7 @@ def _release_locks():
         except:  # pylint: disable=bare-except
             msg = 'Exception occurred releasing lock: {0!r}'.format(dir_lock)
             logger.debug(msg, exc_info=True)
+    _LOCKS.clear()
 
 
 def set_up_core_dir(directory, mode, uid, strict):
@@ -181,7 +181,7 @@ def make_or_verify_dir(directory, mode=0o755, uid=0, strict=False):
 
     """
     try:
-        os.makedirs(directory, mode)
+        filesystem.makedirs(directory, mode)
     except OSError as exception:
         if exception.errno == errno.EEXIST:
             if strict and not check_permissions(directory, mode, uid):
@@ -204,30 +204,24 @@ def check_permissions(filepath, mode, uid=0):
 
     """
     file_stat = os.stat(filepath)
-    return stat.S_IMODE(file_stat.st_mode) == mode and file_stat.st_uid == uid
+    return misc.compare_file_modes(file_stat.st_mode, mode) and file_stat.st_uid == uid
 
 
-def safe_open(path, mode="w", chmod=None, buffering=None):
+def safe_open(path, mode="w", chmod=None):
     """Safely open a file.
 
     :param str path: Path to a file.
     :param str mode: Same os `mode` for `open`.
-    :param int chmod: Same as `mode` for `os.open`, uses Python defaults
+    :param int chmod: Same as `mode` for `filesystem.open`, uses Python defaults
         if ``None``.
-    :param int buffering: Same as `bufsize` for `os.fdopen`, uses Python
-        defaults if ``None``.
 
     """
-    # pylint: disable=star-args
     open_args = ()  # type: Union[Tuple[()], Tuple[int]]
     if chmod is not None:
         open_args = (chmod,)
     fdopen_args = ()  # type: Union[Tuple[()], Tuple[int]]
-    if buffering is not None:
-        fdopen_args = (buffering,)
-    return os.fdopen(
-        os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, *open_args),
-        mode, *fdopen_args)
+    fd = filesystem.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, *open_args)
+    return os.fdopen(fd, mode, *fdopen_args)
 
 
 def _unique_file(path, filename_pat, count, chmod, mode):
@@ -326,7 +320,7 @@ def get_os_info(filepath="/etc/os-release"):
         # Systemd os-release parsing might be viable
         os_name, os_version = get_systemd_os_info(filepath=filepath)
         if os_name:
-            return (os_name, os_version)
+            return os_name, os_version
 
     # Fallback to platform module
     return get_python_os_info()
@@ -469,16 +463,14 @@ def safe_email(email):
     """Scrub email address before using it."""
     if EMAIL_REGEX.match(email) is not None:
         return not email.startswith(".") and ".." not in email
-    else:
-        logger.warning("Invalid email address: %s.", email)
-        return False
+    logger.warning("Invalid email address: %s.", email)
+    return False
 
 
 class _ShowWarning(argparse.Action):
     """Action to log a warning when an argument is used."""
     def __call__(self, unused1, unused2, unused3, option_string=None):
-        sys.stderr.write(
-            "Use of {0} is deprecated.\n".format(option_string))
+        logger.warning("Use of %s is deprecated.", option_string)
 
 
 def add_deprecated_argument(add_argument, argument_name, nargs):
