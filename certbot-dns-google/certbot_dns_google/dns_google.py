@@ -44,6 +44,10 @@ class Authenticator(dns_common.DNSAuthenticator):
                   'information about creating a service account and {1} for information about the' +
                   'required permissions.)').format(ACCT_URL, PERMISSIONS_URL),
             default=None)
+        add('zone-id',
+            help=('Specify Google Cloud DNS zone ID for this operation. Leave empty to auto-detect.'),
+            default=None)
+
 
     def more_info(self): # pylint: disable=missing-docstring,no-self-use
         return 'This plugin configures a DNS TXT record to respond to a dns-01 challenge using ' + \
@@ -73,7 +77,7 @@ class Authenticator(dns_common.DNSAuthenticator):
         self._get_google_client().del_txt_record(domain, validation_name, validation, self.ttl)
 
     def _get_google_client(self):
-        return _GoogleClient(self.conf('credentials'))
+        return _GoogleClient(self.conf('credentials'), zone_id=self.conf('zone-id'))
 
 
 class _GoogleClient(object):
@@ -81,7 +85,7 @@ class _GoogleClient(object):
     Encapsulates all communication with the Google Cloud DNS API.
     """
 
-    def __init__(self, account_json=None, dns_api=None):
+    def __init__(self, account_json=None, dns_api=None, zone_id=None):
 
         scopes = ['https://www.googleapis.com/auth/ndev.clouddns.readwrite']
         if account_json is not None:
@@ -98,6 +102,8 @@ class _GoogleClient(object):
                                        cache_discovery=False)
         else:
             self.dns = dns_api
+        
+        self.zone_id = zone_id
 
     def add_txt_record(self, domain, record_name, record_content, record_ttl):
         """
@@ -110,7 +116,7 @@ class _GoogleClient(object):
         :raises certbot.errors.PluginError: if an error occurs communicating with the Google API
         """
 
-        zone_id = self._find_managed_zone_id(record_name)
+        zone_id = self._find_managed_zone_id(domain)
 
         record_contents = self.get_existing_txt_rrset(zone_id, record_name)
         if record_contents is None:
@@ -177,9 +183,9 @@ class _GoogleClient(object):
         """
 
         try:
-            zone_id = self._find_managed_zone_id(record_name)
+            zone_id = self._find_managed_zone_id(domain)
         except errors.PluginError as e:
-            logger.warn('Error finding zone. Skipping cleanup.')
+            logger.warning('Error finding zone. Skipping cleanup.')
             return
 
         record_contents = self.get_existing_txt_rrset(zone_id, record_name)
@@ -219,7 +225,7 @@ class _GoogleClient(object):
             request = changes.create(project=self.project_id, managedZone=zone_id, body=data)
             request.execute()
         except googleapiclient_errors.Error as e:
-            logger.warn('Encountered error deleting TXT record: %s', e)
+            logger.warning('Encountered error deleting TXT record: %s', e)
 
     def get_existing_txt_rrset(self, zone_id, record_name):
         """
@@ -261,6 +267,8 @@ class _GoogleClient(object):
         :rtype: str
         :raises certbot.errors.PluginError: if the managed zone cannot be found.
         """
+        if self.zone_id:
+            return self.zone_id      
 
         zone_dns_name_guesses = dns_common.base_domain_name_guesses(domain)
 
